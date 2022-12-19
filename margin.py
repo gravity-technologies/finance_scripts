@@ -1,6 +1,6 @@
 from enum import IntEnum
-from itertools import product
-from typing import Dict, List
+from time import time
+from typing import Dict, List, Tuple
 
 from py_vollib.black_scholes import black_scholes
 from py_vollib.black_scholes.implied_volatility import implied_volatility
@@ -29,12 +29,14 @@ class Asset(IntEnum):
 
 
 class Derivative:
-    def __init__(self, instrument: Instrument, underlying_asset: Asset, resolution: int, cash_asset: Asset, expiration_date: int, strike_price: int):
+    def __init__(self, instrument: Instrument, underlying_asset: Asset, resolution: int, expiration_date: int, strike_price: int):
         self.instrument = instrument
         self.underlying_asset = underlying_asset
         self.resolution = resolution  # int4
-        self.cash_asset = cash_asset
-        self.expiration_date = expiration_date  # timestamp
+        # Only for options, and futures
+        # unix days (always expires at 8am UTC)
+        self.expiration_date = expiration_date
+        # Only for options
         self.strike_price = strike_price  # int32
 
 
@@ -44,7 +46,6 @@ def encode_d(d: Derivative) -> str:
         d.instrument.__str__(),
         d.underlying_asset.__str__(),
         d.resolution.__str__(),
-        d.cash_asset.__str__(),
         d.expiration_date.__str__(),
         d.strike_price.__str__(),
     ]
@@ -58,45 +59,67 @@ def decode_d(encoding: str) -> Derivative:
         Instrument(parts[0]),
         Asset(parts[1]),
         int(parts[2]),
-        Asset(parts[3]),
+        int(parts[3]),
         int(parts[4]),
-        int(parts[5]),
     )
+
+
+class Position:
+    """These float values are resolutionised as ints in StarkEx"""
+
+    def __init__(self, asset_id: str, amount: float, realized_price_index: float):
+        # the string encoded form of a derivative
+        self.asset_id = asset_id
+        # Amount of position held
+        self.amount = amount
+        # Realized price of the future/perpetual
+        # This is the cached funding index for perpetuals
+        # This is the average entry price for futures
+        self.realized_price_index = realized_price_index
 
 
 class Vault:
     """These float values are quantized as ints in StarkEx"""
 
-    def __init__(self, collateral_amount: float, derivative_positions: Dict[str, float]):
+    def __init__(self, collateral: Asset, collateral_amount: float, positions: List[Position]):
+        # the collateral asset
+        self.collateral = collateral
+        # the amount of collateral in the vault
         self.collateral_amount = collateral_amount
-        self.derivative_positions = derivative_positions
+        # list of positions
+        self.positions = positions
 
 
 ##############
 # SAMPLE VAULT
 ##############
-sample_call = Derivative(
+NOW = round(time())
+UNIX_DAYS_NOW = NOW // 86400
+UNIX_DAYS_30_DAYS = UNIX_DAYS_NOW + 30
+
+SAMPLE_CALL = Derivative(
     Instrument.OPTION_CALL,
-    Asset.ETH, 4, Asset.USDC, 1234, 1200
+    Asset.ETH, 4, UNIX_DAYS_30_DAYS, 1200
 )
-sample_put = Derivative(
+SAMPLE_PUT = Derivative(
     Instrument.OPTION_PUT,
-    Asset.ETH, 4, Asset.USDC, 1234, 1100
+    Asset.ETH, 4, UNIX_DAYS_30_DAYS, 1100
 )
-sample_future = Derivative(
+SAMPLE_FUTURE = Derivative(
     Instrument.FUTURE,
-    Asset.ETH, 4, Asset.USDC, 1234, 1200
+    Asset.ETH, 4, UNIX_DAYS_30_DAYS, 0
 )
-sample_perp = Derivative(
+SAMPLE_PERP = Derivative(
     Instrument.PERPETUAL,
-    Asset.ETH, 4, Asset.USDC, 0, 0
+    Asset.ETH, 4,  0, 0
 )
-sample_vault = Vault(1000000, {
-    encode_d(sample_call): 1000,
-    encode_d(sample_put): 400,
-    encode_d(sample_future): -100,
-    encode_d(sample_perp): - 500
-})
+SAMPLE_VAULT = Vault(Asset.USDC, 1000000, [
+    Position(encode_d(SAMPLE_CALL), 1000, 0),
+    Position(encode_d(SAMPLE_PUT), 400, 0),
+    Position(encode_d(SAMPLE_FUTURE), -100, 1181.12),
+    Position(encode_d(SAMPLE_PERP), -500, 1181.12)
+]
+)
 
 
 #######################################
@@ -109,8 +132,8 @@ ASSET_PRICES: Dict[Asset, float] = {
 }
 """Assume that all option mark prices are available"""
 OPTION_MARK_PRICES: Dict[str, float] = {
-    encode_d(sample_call): 848.23,
-    encode_d(sample_put): 839.12
+    encode_d(SAMPLE_CALL): 848.23,
+    encode_d(SAMPLE_PUT): 839.12
 }
 
 
@@ -182,21 +205,23 @@ def get_vault_simple_margin(vault: Vault, asset_prices: Dict[Asset, float], opti
     The ratios mentioned here can be modified using configs.
     """
     total_margin = 0.0
-    for raw_position, size in vault.derivative_positions.items():
-        position = decode_d(raw_position)
-        underlying = position.underlying_asset
+    for position in vault.positions:
+        asset_id = position.asset_id
+        size = position.amount
+        deriv = decode_d(asset_id)
+        underlying = deriv.underlying_asset
         underlying_price = asset_prices[underlying]
         position_usd = size * underlying_price
         c = conf[underlying]
-        if position.instrument == Instrument.PERPETUAL or position.instrument == Instrument.FUTURE:
+        if deriv.instrument == Instrument.PERPETUAL or deriv.instrument == Instrument.FUTURE:
             fixed_margin = c.future_maintenance_margin if margin.MAINTENANCE else c.future_initial_margin
             # round down to 0.1% AKA 0.001
             variable_margin = round(position_usd / c.future_variable_margin, 3)
             margin_ratio = min(1.0, fixed_margin + variable_margin)
             total_margin += abs(position_usd * margin_ratio)
-        elif (position.instrument == Instrument.OPTION_CALL or position.instrument == Instrument.OPTION_PUT) and size < 0:
+        elif (deriv.instrument == Instrument.OPTION_CALL or deriv.instrument == Instrument.OPTION_PUT) and size < 0:
             fixed_margin = c.option_maintenance_margin if margin.MAINTENANCE else c.option_initial_margin
-            mark_price = option_mark_prices[raw_position]
+            mark_price = option_mark_prices[asset_id]
             total_margin += abs(position_usd * fixed_margin + mark_price)
     return total_margin
 
@@ -222,15 +247,15 @@ def get_vault_portfolio_margin(vault: Vault, asset_prices: Dict[Asset, float], o
     Simulations are run on an asset level to achieve linear time complexity. O(num_positions).
     """
     # Split vault by asset type O(num_positions)
-    position_by_asset: Dict[Asset, List[str]] = {}
-    for raw_position in vault.derivative_positions.keys():
-        position = decode_d(raw_position)
+    position_by_asset: Dict[Asset, List[Position]] = {}
+    for position in vault.positions:
+        deriv = decode_d(position.asset_id)
         position_by_asset.setdefault(
-            position.underlying_asset, []).append(raw_position)
+            deriv.underlying_asset, []).append(position)
 
     # Calculate max loss per asset type O(num_positions * 4 simulations)
     max_loss_pnl_by_asset: Dict[Asset, float] = {}
-    for underlying, raw_position_list in position_by_asset.items():
+    for underlying, positions in position_by_asset.items():
         c = conf[underlying]
         # cache implied volatility computation since its somewhat intensive
         # and identical across simulations. This prevents it from running 4x
@@ -239,36 +264,39 @@ def get_vault_portfolio_margin(vault: Vault, asset_prices: Dict[Asset, float], o
         for spot_move in [c.spot_range_simulation, -c.spot_range_simulation]:
             for vol_move in [c.vol_range_simulation, -c.vol_range_simulation]:
                 simulation_pnl = 0.0
-                for raw_position in raw_position_list:
-                    position = decode_d(raw_position)
-                    size = vault.derivative_positions[raw_position]
-                    if position.instrument == Instrument.PERPETUAL or position.instrument == Instrument.FUTURE:
+                for position in positions:
+                    asset_id = position.asset_id
+                    deriv = decode_d(asset_id)
+                    size = position.amount
+                    if deriv.instrument == Instrument.PERPETUAL or deriv.instrument == Instrument.FUTURE:
                         simulated_price = underlying_price * (1 + spot_move)
                         unit_pnl = simulated_price - underlying_price
                         simulation_pnl += size * unit_pnl
-                    elif position.instrument == Instrument.OPTION_CALL or position.instrument == Instrument.OPTION_PUT:
-                        mark_price = option_mark_prices[raw_position]
-                        flag = 'c' if position.instrument == Instrument.OPTION_CALL else 'p'
-                        expiration = 0.3  # TODO: remove time to expiration hardcode
-                        current_iv: float = iv_cache.get(raw_position, implied_volatility(
+                    elif deriv.instrument == Instrument.OPTION_CALL or deriv.instrument == Instrument.OPTION_PUT:
+                        mark_price = option_mark_prices[asset_id]
+                        flag = 'c' if deriv.instrument == Instrument.OPTION_CALL else 'p'
+                        # 8am UTC on expiration_date - unix time now
+                        secs_to_expiry = deriv.expiration_date * 86400 + 28800 - NOW
+                        years_to_expiry = secs_to_expiry / 31, 536, 000
+                        current_iv: float = iv_cache.get(asset_id, implied_volatility(
                             mark_price,
                             underlying_price,
-                            position.strike_price,
-                            expiration,
+                            deriv.strike_price,
+                            years_to_expiry,
                             conf[underlying].risk_free_rate,
                             flag
                         ))
-                        iv_cache[raw_position] = current_iv
+                        iv_cache[asset_id] = current_iv
                         simulated_price: float = black_scholes(
                             mark_price,
                             underlying_price * (1 + spot_move),
-                            position.strike_price,
+                            deriv.strike_price,
                             current_iv + vol_move,
-                            expiration,
+                            years_to_expiry,
                             conf[underlying].risk_free_rate
                         )
                         unit_pnl = simulated_price - mark_price
-                        if position.instrument == Instrument.OPTION_CALL:
+                        if deriv.instrument == Instrument.OPTION_CALL:
                             if size > 0:
                                 simulation_pnl += max(0, size * unit_pnl)
                             else:
@@ -291,4 +319,49 @@ def get_vault_portfolio_margin(vault: Vault, asset_prices: Dict[Asset, float], o
         return PORTFOLIO_MARGIN_INITIAL_MULTIPLIER * abs(max_loss_pnl)
     return abs(max_loss_pnl)
 
-#
+###########################
+# VAULT BALANCE COMPUTATION
+###########################
+
+
+def get_vault_balance(vault: Vault, asset_prices: Dict[Asset, float], option_mark_prices: Dict[str, float]) -> float:
+    """
+    Applies unrealized PnL on top of vault collateral to get vault balance 
+    """
+    balance = vault.collateral_amount
+    for position in vault.positions:
+        asset_id = position.asset_id
+        size = position.amount
+        realized_price_index = position.realized_price_index
+        deriv = decode_d(asset_id)
+        underlying = deriv.underlying_asset
+        underlying_price = asset_prices[underlying]
+
+        if deriv.instrument == Instrument.PERPETUAL or deriv.instrument == Instrument.FUTURE:
+            unit_pnl = realized_price_index - underlying_price
+            balance += size * unit_pnl
+        elif deriv.instrument == Instrument.OPTION_CALL:
+            unit_pnl = option_mark_prices[asset_id]
+            if size > 0:
+                balance += max(0, size * unit_pnl)
+            else:
+                balance += min(0, size * unit_pnl)
+        elif deriv.instrument == Instrument.OPTION_PUT:
+            unit_pnl = option_mark_prices[asset_id]
+            if size > 0:
+                balance -= max(0, size * unit_pnl)
+            else:
+                balance -= min(0, size * unit_pnl)
+
+    return balance
+
+####################
+# TRADE INTERACTIONS
+####################
+
+
+# def trade(vault: Vault, asset_id: str, collateral_size: float, synthetic_size: float) -> Tuple[Vault, bool]:
+#     # if not in vault, simply apply changes
+
+#     # if in vault, options apply changes, perps apply changes,
+#     return (vault, True)
