@@ -6,6 +6,9 @@ from py_vollib.black_scholes import black_scholes
 from py_vollib.black_scholes.implied_volatility import implied_volatility
 
 
+##################
+# TYPE DEFINITIONS
+##################
 class MarginType(IntEnum):
     INITIAL = 1
     MAINTENANCE = 2
@@ -69,7 +72,9 @@ class Vault:
         self.derivative_positions = derivative_positions
 
 
-# Generate SAMPLE DATA
+##############
+# SAMPLE VAULT
+##############
 sample_call = Derivative(
     Instrument.OPTION_CALL,
     Asset.ETH, 4, Asset.USDC, 1234, 1200
@@ -93,7 +98,10 @@ sample_vault = Vault(1000000, {
     encode_d(sample_perp): - 500
 })
 
-# Global State (Available in blockchain)
+
+#######################################
+# ORACLE STATE (price feed via oracles)
+#######################################
 ASSET_PRICES: Dict[Asset, float] = {
     Asset.USDC: 1.000,
     Asset.ETH: 1182.42,
@@ -105,7 +113,10 @@ OPTION_MARK_PRICES: Dict[str, float] = {
     encode_d(sample_put): 839.12
 }
 
-# StarkEx Configs
+
+###################################
+# STARKEX CONFIGS (set by operator)
+###################################
 PORTFOLIO_MARGIN_INITIAL_MULTIPLIER = 1.3
 
 
@@ -126,9 +137,10 @@ ASSET_CONFIG: Dict[Asset, AssetConfig] = {
     Asset.BTC: AssetConfig(50000, 0.01, 0.02, 0.05, 0.10, 0.2, 0.45, 0.0)
 }
 
-# Margin computation
 
-
+####################
+# MARGIN COMPUTATION
+####################
 def get_vault_margin(vault: Vault, asset_prices: Dict[Asset, float], option_mark_prices: Dict[str, float], conf: Dict[Asset, AssetConfig], margin: MarginType) -> float:
     """
     A vault's margin is simply the minimum of the values returned by
@@ -191,44 +203,6 @@ def get_vault_simple_margin(vault: Vault, asset_prices: Dict[Asset, float], opti
 # Portfolio Margin
 
 
-def get_spot_move_simulations(conf: Dict[Asset, AssetConfig]) -> List[Dict[Asset, float]]:
-    """
-    Generates the list of spot move simulations we need to run
-    eg. [{BTC: 0.8, ETH: 0.8}, {BTC: 0.8, ETH: 1.2}, {BTC: 1.2, ETH: 0.8}, {BTC: 1.2, ETH: 1.2}]
-    """
-    # Generates binary cartesian products 00 01 10 11
-    simulations = product(range(2), repeat=len(conf))
-    output = []
-    for trial in simulations:
-        i = 0
-        trial_output = {}
-        for asset, c in conf.items():
-            sim = c.spot_range_simulation
-            trial_output[asset] = 1.0 + sim if trial[i] == 1 else 1.0 - sim
-            i += 1
-        output.append(trial_output)
-    return output
-
-
-def get_vol_move_simulations(conf: Dict[Asset, AssetConfig]) -> List[Dict[Asset, float]]:
-    """
-    Generates the list of volatility move simulations we need to run
-    eg. [{BTC: -0.45, ETH: -0.45}, {BTC: -0.45, ETH: 0.45}, {BTC: 0.45, ETH: -0.45}, {BTC: 0.45, ETH: 0.45}]
-    """
-    # Generates binary cartesian products 00 01 10 11
-    simulations = product(range(2), repeat=len(conf))
-    output = []
-    for trial in simulations:
-        i = 0
-        trial_output = {}
-        for asset, c in conf.items():
-            sim = c.vol_range_simulation
-            trial_output[asset] = sim if trial[i] == 1 else -sim
-            i += 1
-        output.append(trial_output)
-    return output
-
-
 def get_vault_portfolio_margin(vault: Vault, asset_prices: Dict[Asset, float], option_mark_prices: Dict[str, float], conf: Dict[Asset, AssetConfig], margin: MarginType) -> float:
     """
     The portfolio margin algorithm uses a Value-at-Risk (VaR) approach to compute margins.
@@ -242,66 +216,79 @@ def get_vault_portfolio_margin(vault: Vault, asset_prices: Dict[Asset, float], o
     using the options mark price. Then, applies the black scholes model on top of the 
     simulated spot/vol moves to calculate PnL.
 
-    The number of simulations run is: 4 ^ num_assets. This number gets really large really quickly
-    but we can apply some optimizations to significantly reduce the number of computations.
+    This PnL simulation assumes 0 correlation between different asset types, it also takes
+    on all the assumptions laid out by the Black Scholes Model.
 
-    For each position, there's only 4 potential PnLs that it can generate. We store these in a
-    Dict[raw_position, Dict[trial_data, position_pnl]]. Then we simply mix and match these position 
-    PnLs on each simulated run. This reduces heavy computation to linear time, and only absorb
-    exponential time complexity for additions and subtractions.
-
-    This optimization is not applied in the demo code to simplify things.
+    Simulations are run on an asset level to achieve linear time complexity. O(num_positions).
     """
+    # Split vault by asset type O(num_positions)
+    position_by_asset: Dict[Asset, List[str]] = {}
+    for raw_position in vault.derivative_positions.keys():
+        position = decode_d(raw_position)
+        position_by_asset.setdefault(
+            position.underlying_asset, []).append(raw_position)
+
+    # Calculate max loss per asset type O(num_positions * 4 simulations)
+    max_loss_pnl_by_asset: Dict[Asset, float] = {}
+    for underlying, raw_position_list in position_by_asset.items():
+        c = conf[underlying]
+        # cache implied volatility computation since its somewhat intensive
+        # and identical across simulations. This prevents it from running 4x
+        iv_cache: Dict[str, float] = {}
+        underlying_price = asset_prices[underlying]
+        for spot_move in [c.spot_range_simulation, -c.spot_range_simulation]:
+            for vol_move in [c.vol_range_simulation, -c.vol_range_simulation]:
+                simulation_pnl = 0.0
+                for raw_position in raw_position_list:
+                    position = decode_d(raw_position)
+                    size = vault.derivative_positions[raw_position]
+                    if position.instrument == Instrument.PERPETUAL or position.instrument == Instrument.FUTURE:
+                        simulated_price = underlying_price * (1 + spot_move)
+                        unit_pnl = simulated_price - underlying_price
+                        simulation_pnl += size * unit_pnl
+                    elif position.instrument == Instrument.OPTION_CALL or position.instrument == Instrument.OPTION_PUT:
+                        mark_price = option_mark_prices[raw_position]
+                        flag = 'c' if position.instrument == Instrument.OPTION_CALL else 'p'
+                        expiration = 0.3  # TODO: remove time to expiration hardcode
+                        current_iv: float = iv_cache.get(raw_position, implied_volatility(
+                            mark_price,
+                            underlying_price,
+                            position.strike_price,
+                            expiration,
+                            conf[underlying].risk_free_rate,
+                            flag
+                        ))
+                        iv_cache[raw_position] = current_iv
+                        simulated_price: float = black_scholes(
+                            mark_price,
+                            underlying_price * (1 + spot_move),
+                            position.strike_price,
+                            current_iv + vol_move,
+                            expiration,
+                            conf[underlying].risk_free_rate
+                        )
+                        unit_pnl = simulated_price - mark_price
+                        if position.instrument == Instrument.OPTION_CALL:
+                            if size > 0:
+                                simulation_pnl += max(0, size * unit_pnl)
+                            else:
+                                simulation_pnl += min(0, size * unit_pnl)
+                        else:
+                            if size > 0:
+                                simulation_pnl -= max(0, size * unit_pnl)
+                            else:
+                                simulation_pnl -= min(0, size * unit_pnl)
+                max_loss_pnl_by_asset[underlying] = min(
+                    max_loss_pnl_by_asset[underlying], simulation_pnl)
+
+    # Sum asset max losses
     max_loss_pnl = 0.0
-    # Spot Range Max Loss
-    for spot_move_trial in get_spot_move_simulations(conf):
-        # Implied Volatility Max Loss
-        for vol_move_trial in get_vol_move_simulations(conf):
-            trial_pnl = 0.0
-            for raw_position, size in vault.derivative_positions.items():
-                position = decode_d(raw_position)
-                underlying = position.underlying_asset
-                underlying_price = asset_prices[underlying]
-                spot_move = spot_move_trial[underlying]
-                if position.instrument == Instrument.PERPETUAL or position.instrument == Instrument.FUTURE:
-                    simulated_price = underlying_price * spot_move
-                    unit_pnl = simulated_price - underlying_price
-                    trial_pnl += size * unit_pnl
-                elif position.instrument == Instrument.OPTION_CALL or position.instrument == Instrument.OPTION_PUT:
-                    vol_move = vol_move_trial[underlying]
-                    mark_price = option_mark_prices[raw_position]
-                    flag = 'c' if position.instrument == Instrument.OPTION_CALL else 'p'
-                    expiration = 0.3  # TODO: remove time to expiration hardcode
-                    current_iv: float = implied_volatility(
-                        mark_price,
-                        underlying_price,
-                        position.strike_price,
-                        expiration,
-                        conf[underlying].risk_free_rate,
-                        flag
-                    )
-                    simulated_price: float = black_scholes(
-                        mark_price,
-                        underlying_price * spot_move,
-                        position.strike_price,
-                        current_iv + vol_move,
-                        expiration,
-                        conf[underlying].risk_free_rate
-                    )
-                    unit_pnl = simulated_price - mark_price
-                    if position.instrument == Instrument.OPTION_CALL:
-                        if size > 0:
-                            trial_pnl += max(0, size * unit_pnl)
-                        else:
-                            trial_pnl += min(0, size * unit_pnl)
-                    else:
-                        if size > 0:
-                            trial_pnl -= max(0, size * unit_pnl)
-                        else:
-                            trial_pnl -= min(0, size * unit_pnl)
-            max_loss_pnl = min(max_loss_pnl, trial_pnl)
+    for asset_pnl in max_loss_pnl_by_asset.values():
+        max_loss_pnl += asset_pnl
 
     # Account for maintenance/initial margin
     if margin == MarginType.INITIAL:
         return PORTFOLIO_MARGIN_INITIAL_MULTIPLIER * abs(max_loss_pnl)
     return abs(max_loss_pnl)
+
+#
