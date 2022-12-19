@@ -106,6 +106,7 @@ OPTION_MARK_PRICES: Dict[str, float] = {
 }
 
 # StarkEx Configs
+PORTFOLIO_MARGIN_INITIAL_MULTIPLIER = 1.3
 
 
 class AssetConfig:
@@ -174,17 +175,17 @@ def get_vault_simple_margin(vault: Vault, asset_prices: Dict[Asset, float], opti
         underlying = position.underlying_asset
         underlying_price = asset_prices[underlying]
         position_usd = size * underlying_price
-        asset_conf = conf[underlying]
+        c = conf[underlying]
         if position.instrument == Instrument.PERPETUAL or position.instrument == Instrument.FUTURE:
-            fixed_margin = asset_conf.future_maintenance_margin if margin.MAINTENANCE else asset_conf.future_initial_margin
-            variable_margin = round(
-                position_usd / asset_conf.future_variable_margin, 3)  # round down to 0.1% AKA 0.001
+            fixed_margin = c.future_maintenance_margin if margin.MAINTENANCE else c.future_initial_margin
+            # round down to 0.1% AKA 0.001
+            variable_margin = round(position_usd / c.future_variable_margin, 3)
             margin_ratio = min(1.0, fixed_margin + variable_margin)
-            total_margin += position_usd * margin_ratio
+            total_margin += abs(position_usd * margin_ratio)
         elif (position.instrument == Instrument.OPTION_CALL or position.instrument == Instrument.OPTION_PUT) and size < 0:
-            fixed_margin = asset_conf.option_maintenance_margin if margin.MAINTENANCE else asset_conf.option_initial_margin
-            total_margin += position_usd * fixed_margin + \
-                option_mark_prices[raw_position]
+            fixed_margin = c.option_maintenance_margin if margin.MAINTENANCE else c.option_initial_margin
+            mark_price = option_mark_prices[raw_position]
+            total_margin += abs(position_usd * fixed_margin + mark_price)
     return total_margin
 
 # Portfolio Margin
@@ -201,8 +202,8 @@ def get_spot_move_simulations(conf: Dict[Asset, AssetConfig]) -> List[Dict[Asset
     for trial in simulations:
         i = 0
         trial_output = {}
-        for asset, asset_conf in conf.items():
-            sim = asset_conf.spot_range_simulation
+        for asset, c in conf.items():
+            sim = c.spot_range_simulation
             trial_output[asset] = 1.0 + sim if trial[i] == 1 else 1.0 - sim
             i += 1
         output.append(trial_output)
@@ -220,8 +221,8 @@ def get_vol_move_simulations(conf: Dict[Asset, AssetConfig]) -> List[Dict[Asset,
     for trial in simulations:
         i = 0
         trial_output = {}
-        for asset, asset_conf in conf.items():
-            sim = asset_conf.vol_range_simulation
+        for asset, c in conf.items():
+            sim = c.vol_range_simulation
             trial_output[asset] = sim if trial[i] == 1 else -sim
             i += 1
         output.append(trial_output)
@@ -289,4 +290,8 @@ def get_vault_portfolio_margin(vault: Vault, asset_prices: Dict[Asset, float], o
                         else:
                             trial_pnl -= min(0, size * unit_pnl)
             max_loss_pnl = min(max_loss_pnl, trial_pnl)
+
+    # Account for maintenance/initial margin
+    if margin == MarginType.INITIAL:
+        return PORTFOLIO_MARGIN_INITIAL_MULTIPLIER * abs(max_loss_pnl)
     return abs(max_loss_pnl)
