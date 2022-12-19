@@ -241,6 +241,16 @@ def get_vault_portfolio_margin(vault: Vault, asset_prices: Dict[Asset, float], o
     For options, it gets a little more complex. It computes the current implied volatility 
     using the options mark price. Then, applies the black scholes model on top of the 
     simulated spot/vol moves to calculate PnL.
+
+    The number of simulations run is: 4 ^ num_assets. This number gets really large really quickly
+    but we can apply some optimizations to significantly reduce the number of computations.
+
+    For each position, there's only 4 potential PnLs that it can generate. We store these in a
+    Dict[raw_position, Dict[trial_data, position_pnl]]. Then we simply mix and match these position 
+    PnLs on each simulated run. This reduces heavy computation to linear time, and only absorb
+    exponential time complexity for additions and subtractions.
+
+    This optimization is not applied in the demo code to simplify things.
     """
     max_loss_pnl = 0.0
     # Spot Range Max Loss
