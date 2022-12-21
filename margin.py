@@ -38,8 +38,8 @@ def decode_a(asset_id: str) -> Asset:
 
 class Derivative:
     def __init__(self, instrument: Instrument, underlying_asset: Asset, resolution: int, expiration_date: int, strike_price: int):
-        self.instrument = instrument #int2
-        self.underlying_asset = underlying_asset # int16
+        self.instrument = instrument  # int2
+        self.underlying_asset = underlying_asset  # int16
         self.resolution = resolution  # int4
         # Only for options, and futures
         # int24: unix days (always expires at 8am UTC)
@@ -76,6 +76,9 @@ class Position:
     """
     balance is resolutionised as ints in StarkEx
     SRC: https://github.com/starkware-libs/stark-perpetual/blob/master/src/services/perpetual/cairo/position/position.cairo#L8
+
+    This is currently called PositionAsset, but traders usually refer to each deriv long/short as a position.
+    We recommend calling this Position.
     """
 
     def __init__(self, asset_id: str, balance: float, cached_funding_index: float):
@@ -91,6 +94,9 @@ class Vault:
     """
     collateral_balance is quantized as ints in StarkEx
     SRC: https://github.com/starkware-libs/stark-perpetual/blob/master/src/services/perpetual/cairo/position/position.cairo#L16
+
+    This is currently called Position in code, but Vault in documentation. 
+    Vault is the more intuitive term that we recommend. Position usually refers to a long/short.
     """
 
     def __init__(self, public_key: str, collateral: Asset, collateral_balance: float, positions: List[Position]):
@@ -103,34 +109,45 @@ class Vault:
         self.positions = positions
 
 
-##############
-# SAMPLE VAULT
-##############
+#############
+# SAMPLE DATA
+#############
+"""
+The sample data is used for demo purposes only to help make sense of the code.
+
+NOW is used as system clock time.
+"""
 NOW = round(time())
 UNIX_DAYS_NOW = NOW // 86400
-UNIX_DAYS_30_DAYS = UNIX_DAYS_NOW + 30
 
 SAMPLE_CALL = Derivative(
     Instrument.OPTION_CALL,
-    Asset.ETH, 4, UNIX_DAYS_30_DAYS, 1200
+    Asset.ETH, 4, UNIX_DAYS_NOW + 10, 1200
 )
 SAMPLE_PUT = Derivative(
     Instrument.OPTION_PUT,
-    Asset.ETH, 4, UNIX_DAYS_30_DAYS, 1100
+    Asset.ETH, 4, UNIX_DAYS_NOW + 15, 1100
 )
 SAMPLE_FUTURE = Derivative(
     Instrument.FUTURE,
-    Asset.ETH, 4, UNIX_DAYS_30_DAYS, 0
+    Asset.ETH, 4, UNIX_DAYS_NOW + 30, 0
 )
 SAMPLE_PERP = Derivative(
     Instrument.PERPETUAL,
     Asset.ETH, 4,  0, 0
 )
+
+SAMPLE_EXPIRED_OPTION = Derivative(
+    Instrument.OPTION_CALL,
+    Asset.ETH, 4, UNIX_DAYS_NOW - 1, 1200
+)
+
 SAMPLE_VAULT = Vault("0xdeadbeef", Asset.USDC, 1000000, [
     Position(encode_d(SAMPLE_CALL), 1000, 0),
     Position(encode_d(SAMPLE_PUT), 400, 0),
-    Position(encode_d(SAMPLE_FUTURE), -100, 1181.12),
-    Position(encode_d(SAMPLE_PERP), -500, 1181.12)
+    Position(encode_d(SAMPLE_FUTURE), -100, 0),
+    Position(encode_d(SAMPLE_PERP), -500, 1181.12),
+    Position(encode_d(SAMPLE_EXPIRED_OPTION), -200, 0)
 ]
 )
 
@@ -152,7 +169,7 @@ ORACLE_INDEX_PRICES: Dict[str, float] = {
 }
 """
 Market prices are uploaded by the operator based on best bid/ask pair.
-This is required for options where index prices are not usable.
+This is required for options where spot index prices are not useful for deriving value.
 But this also helps provide futures/perps market prices to make margin
 computations more accurate.
 
@@ -192,15 +209,39 @@ MOVING_AVERAGE_PRICES: Dict[str, float] = {
     encode_d(SAMPLE_FUTURE): 1182.19
 }
 
+"""
+The price at which all expired options and futures settled.
+
+There is one entry here per underlying asset, and expiry date.
+"""
+SETTLEMENT_PRICES: Dict[str, float] = {
+    # The key is an encoded derivative with just the asset and expiry filled
+    # eg. It specifies, on 24 Dec 2022 0800 UTC, ETH was at 1182.66
+    str(0x003000232000000): 1182.66,
+}
+
+# This is a bit mask that applies to the derivative to figure out whether it
+# has been settled
+#
+# eg.
+# settled_price = SETTLEMENT_PRICES.get(asset_id & SETTLEMENT_MASK, None)
+# if settled_price == None:
+#     "not expired"
+# else:
+#     "expired at settled_price"
+SETTLEMENT_MASK: str = str(0x004000fff000000)
+
 
 class Prices:
-    def __init__(self, oracle_index: Dict[str, float], market: Dict[str, float], moving_avg: Dict[str, float]):
+    def __init__(self, oracle_index: Dict[str, float], market: Dict[str, float], moving_avg: Dict[str, float], settled: Dict[str, float]):
         self.oracle_index = oracle_index
         self.market = market
         self.moving_avg = moving_avg
+        self.settled = settled
 
 
-PRICES = Prices(ORACLE_INDEX_PRICES, MARKET_PRICES,  MOVING_AVERAGE_PRICES)
+PRICES = Prices(ORACLE_INDEX_PRICES, MARKET_PRICES,
+                MOVING_AVERAGE_PRICES, SETTLEMENT_PRICES)
 
 ###################################
 # STARKEX CONFIGS (set by operator)
@@ -231,30 +272,53 @@ ASSET_CONFIG: Dict[Asset, AssetConfig] = {
 
 
 def get_spot_mark_price(asset_id: str, prices: Prices) -> float:
+    """
+    Spot mark price is the average of all three price sources (whenever available)
+    """
     sources = [prices.oracle_index[asset_id]]
-    market = prices.market.get(asset_id, 0.0)
-    if market > 0.0:
+    market = prices.market.get(asset_id, None)
+    if market != None:
         sources.append(market)
-    moving_avg = prices.moving_avg.get(asset_id, 0.0)
-    if moving_avg > 0.0:
+    moving_avg = prices.moving_avg.get(asset_id, None)
+    if moving_avg != None:
         sources.append(moving_avg)
     return sum(sources) / len(sources)
+
+
+def get_deriv_settled_price(asset_id: str, prices: Prices):
+    """
+    Determines price if derivative (options & futures) has already been settled
+    """
+    settled_price = prices.settled.get(
+        str(int(asset_id) & int(SETTLEMENT_MASK)), None)
+    if settled_price == None:
+        return None
+    deriv = decode_d(asset_id)
+    if deriv.instrument == Instrument.FUTURE:
+        return settled_price
+    elif deriv.instrument == Instrument.OPTION_CALL or deriv.instrument == Instrument.OPTION_PUT:
+        # In the money options expire with a value, out of the money options expire worthless
+        return max(0, settled_price - deriv.strike_price)
+    return None  # will never be hit
 
 
 def get_deriv_mark_price(asset_id: str, prices: Prices) -> float:
     """
     Mark Price is the simple average of all three price sources (whenever available)
-    Index Price is only used for futures and perpetuals
+    If the derivative is already settled, it uses the settled price instead
     """
+    settled_price = get_deriv_settled_price(asset_id, prices)
+    if settled_price != None:
+        return settled_price
     deriv = decode_d(asset_id)
     sources = []
     if deriv.instrument == Instrument.PERPETUAL or deriv.instrument == Instrument.FUTURE:
         sources.append(prices.oracle_index[encode_a(deriv.underlying_asset)])
-    market = prices.market.get(asset_id, 0.0)
-    if market > 0.0:
+    market = prices.market.get(asset_id, None)
+    if market != None:
         sources.append(market)
-    moving_avg = prices.moving_avg.get(asset_id, 0.0)
-    if moving_avg > 0.0:
+    moving_avg = prices.moving_avg.get(asset_id, None)
+    if moving_avg != None:
         sources.append(moving_avg)
     return sum(sources) / len(sources)
 
@@ -282,18 +346,19 @@ def get_vault_simple_margin(vault: Vault, prices: Prices, conf: Dict[Asset, Asse
     simple margin simply sums the margin requirements of each position
 
     Perpetuals and Futures follow the below formula
-      Spot Notional            = Size * Spot Mark Price
-      Initial Margin Ratio     = 2% + Spot Notional / $50000
-      Maintenance Margin Ratio = 1% + Spot Notional / $50000
-      Margin                   = Size * Deriv Mark Price * Margin Ratio
+      Deriv Notional           = Size * Deriv Mark Price
+      Initial Margin Ratio     = 2% + Deriv Notional / $50000
+      Maintenance Margin Ratio = 1% + Deriv Notional / $50000
+      Margin                   = Deriv Notional * Margin Ratio
 
     Rationale being that larger positions are more risky, and more difficult to liquidate.
     Hence, larger positions require higher margin ratios, and offer lower leverage.
 
     Options follow the below formula
+      Spot Notional            = Size * Spot Mark Price
       Initial Margin Ratio     = 10%
       Maintenance Margin Ratio =  5%
-      Margin                   = Spot Notional * Margin Ratio + Option Mark Price
+      Margin                   = Spot Notional * Margin Ratio + Deriv Notional
 
     Rationale being that there are many options with different strike prices and expiry in the market.
     Hence, a fixed margin ratio is applied per option. 
@@ -303,25 +368,27 @@ def get_vault_simple_margin(vault: Vault, prices: Prices, conf: Dict[Asset, Asse
     total_margin = 0.0
     for position in vault.positions:
         asset_id = position.asset_id
+        # if derivative is already settled, skip to next position. It does not require margin.
+        settled_price = get_deriv_settled_price(asset_id, prices)
+        if settled_price != None:
+            continue
         size = position.balance
         deriv = decode_d(asset_id)
         underlying = deriv.underlying_asset
-        spot_mark_price = get_spot_mark_price(encode_a(underlying), prices)
-        spot_notional = size * spot_mark_price
+        deriv_notional = size * get_deriv_mark_price(asset_id, prices)
         c = conf[underlying]
         if deriv.instrument == Instrument.PERPETUAL or deriv.instrument == Instrument.FUTURE:
             fixed_margin = c.future_maintenance_margin if margin.MAINTENANCE else c.future_initial_margin
             # round down to 0.1% AKA 0.001
             variable_margin = round(
-                spot_notional / c.future_variable_margin, 3)
+                deriv_notional / c.future_variable_margin, 3)
             margin_ratio = min(1.0, fixed_margin + variable_margin)
-            deriv_mark_price = get_deriv_mark_price(asset_id, prices)
-            total_margin += abs(size * deriv_mark_price * margin_ratio)
+            total_margin += abs(deriv_notional * margin_ratio)
         elif (deriv.instrument == Instrument.OPTION_CALL or deriv.instrument == Instrument.OPTION_PUT) and size < 0:
+            spot_notional = size * \
+                get_spot_mark_price(encode_a(underlying), prices)
             fixed_margin = c.option_maintenance_margin if margin.MAINTENANCE else c.option_initial_margin
-            deriv_mark_price = get_deriv_mark_price(asset_id, prices)
-            total_margin += abs(spot_notional *
-                                fixed_margin + deriv_mark_price)
+            total_margin += abs(spot_notional * fixed_margin + deriv_notional)
     return total_margin
 
 # Portfolio Margin
@@ -348,6 +415,10 @@ def get_vault_portfolio_margin(vault: Vault, prices: Prices, conf: Dict[Asset, A
     # Split vault by asset type O(num_positions)
     position_by_asset: Dict[Asset, List[Position]] = {}
     for position in vault.positions:
+        # if derivative is already settled, skip to next position. It does not require margin.
+        settled_price = prices.settled.get(position.asset_id, None)
+        if settled_price != None:
+            continue
         deriv = decode_d(position.asset_id)
         position_by_asset.setdefault(
             deriv.underlying_asset, []).append(position)
@@ -425,27 +496,13 @@ def get_vault_portfolio_margin(vault: Vault, prices: Prices, conf: Dict[Asset, A
 
 def get_vault_balance(vault: Vault, prices: Prices) -> float:
     """
-    Applies unrealized PnL on top of vault collateral to get vault balance 
+    Sums up collateral balance with current value of all derivative positions 
     """
     balance = vault.collateral_balance
     for position in vault.positions:
         asset_id = position.asset_id
         size = position.balance
-        deriv = decode_d(asset_id)
-        if deriv.instrument == Instrument.PERPETUAL or deriv.instrument == Instrument.FUTURE:
-            balance += size * get_deriv_mark_price(asset_id, prices)
-        elif deriv.instrument == Instrument.OPTION_CALL:
-            value = size * get_deriv_mark_price(asset_id, prices)
-            if size > 0:
-                balance += max(0, value)
-            else:
-                balance += min(0, value)
-        elif deriv.instrument == Instrument.OPTION_PUT:
-            value = size * get_deriv_mark_price(asset_id, prices)
-            if size > 0:
-                balance -= max(0, value)
-            else:
-                balance -= min(0, value)
+        balance += size * get_deriv_mark_price(asset_id, prices)
     return balance
 
 
@@ -461,66 +518,53 @@ def get_vault_status(vault: Vault, prices: Prices, conf: Dict[Asset, AssetConfig
         return True  # PerpetualErrorCode.SUCCESS
     return False  # PerpetualErrorCode.OUT_OF_RANGE_TOTAL_RISK
 
+#######################
+# DERIVATIVE SETTLEMENT
+#######################
+
+
+def vault_apply_funding(vault: Vault) -> Vault:
+    """
+    SRC: https://github.com/starkware-libs/stark-perpetual/blob/master/src/services/perpetual/cairo/position/funding.cairo#L73
+
+    Funding is the way in which perpetuals settlement occurs. No changes neccessary.
+    """
+    return vault
+
+
+def vault_apply_settlement(vault: Vault, prices: Prices) -> Vault:
+    """
+    This applies both funding, and options/futures settlement.
+
+    All callsites calling funding now, should call this instead.
+    """
+    vault = vault_apply_funding(vault)
+    new_balance = vault.collateral_balance
+    new_positions = []
+    for position in vault.positions:
+        # if derivative is ready to be settled, settle it
+        settled_price = get_deriv_settled_price(position.asset_id, prices)
+        if settled_price != None:
+            new_balance += position.balance * settled_price
+            continue
+        new_positions.append(position)
+    return Vault(vault.public_key, vault.collateral, new_balance, new_positions)
+
 ####################
 # TRADE INTERACTIONS
 ####################
 
 
-class OrderBase:
-    """
-    SRC: https://github.com/starkware-libs/stark-perpetual/blob/master/src/services/exchange/cairo/order.cairo#L2
-    """
+"""
+Almost identical to current design, except that it applies two pre-transaction hooks:
+1. Perpetual Funding
+2. Option & Future Settlement
 
-    def __init__(self, nonce: int, public_key: str, expiration_timestamp: int, signature_r: str, signature_s: str):
-        self.nonce = nonce
-        self.public_key = public_key
-        self.expiration_timestamp = expiration_timestamp
-        self.signature_r = signature_r
-        self.signature_s = signature_s
+For all transactions
+1. Buyer pays the full value of the deriv trade price to seller in collateral. Buyer receives long position.
+2. Seller receives the full value of the deriv trade price from buyer in collateral. Seller receives short position.
 
+This is identical to before
 
-class LimitOrder:
-    """
-    SRC: https://github.com/starkware-libs/stark-perpetual/blob/master/src/services/perpetual/cairo/order/limit_order.cairo#L10
-    """
-
-    def __init__(self, base: OrderBase, balance_synthetic: int, balance_collateral: int, balance_fee: int, asset_id_synthetic: int, asset_id_collateral: Asset, position_id: Vault, is_buying_synthetic: bool):
-        self.base = base
-        self.balance_synthetic = balance_synthetic
-        self.balance_collateral = balance_collateral
-        self.balance_fee = balance_fee
-        self.asset_id_synthetic = asset_id_synthetic
-        self.asset_id_collateral = asset_id_collateral
-        self.position_id = position_id
-        self.is_buying_synthetic = is_buying_synthetic
-
-
-def execute_limit_order(limit_order: LimitOrder, vault: Vault, actual_collateral: int,  actual_synthetic: int, actual_fee: float) -> Tuple[Vault, bool]:
-    """
-    SRC: https://github.com/starkware-libs/stark-perpetual/blob/master/src/services/perpetual/cairo/transactions/execute_limit_order.cairo#L30
-
-    Almost identical to current design, except that it applies two pre-transaction hooks:
-    1. Perpetual Funding
-    2. Option & Future Settlement
-
-    https://github.com/starkware-libs/stark-perpetual/blob/master/src/services/perpetual/cairo/position/update_position.cairo#L58
-    """
-
-    # Check that asset_id_collateral is collateral.
-    if limit_order.asset_id_collateral != vault.collateral:
-        return (vault, False)  # PerpetualErrorCode.INVALID_COLLATERAL_ASSET_ID
-
-    # local collateral_delta
-    # local synthetic_delta
-    # if limit_order.is_buying_synthetic != 0:
-    #     assert collateral_delta = (-actual_collateral) - actual_fee
-    #     assert synthetic_delta = actual_synthetic
-    # else:
-    #     assert collateral_delta = actual_collateral - actual_fee
-    #     assert synthetic_delta = -actual_synthetic
-    # end
-
-    # if not in vault, simply apply changes
-
-    # if in vault, options apply changes, perps apply changes,
-    return (vault, True)
+SRC: https://github.com/starkware-libs/stark-perpetual/blob/master/src/services/perpetual/cairo/position/update_position.cairo#L58
+"""
