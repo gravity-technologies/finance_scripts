@@ -296,9 +296,11 @@ def get_deriv_settled_price(asset_id: str, prices: Prices):
     deriv = decode_d(asset_id)
     if deriv.instrument == Instrument.FUTURE:
         return settled_price
-    elif deriv.instrument == Instrument.OPTION_CALL or deriv.instrument == Instrument.OPTION_PUT:
+    elif deriv.instrument == Instrument.OPTION_CALL:
         # In the money options expire with a value, out of the money options expire worthless
         return max(0, settled_price - deriv.strike_price)
+    elif deriv.instrument == Instrument.OPTION_PUT:
+        return max(0,  deriv.strike_price - settled_price)
     return None  # will never be hit
 
 
