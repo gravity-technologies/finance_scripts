@@ -158,26 +158,37 @@ SAMPLE_VAULT = Vault("0xdeadbeef", Asset.USDC, 1000000, [
 """
 Index prices keep track of spot index prices across exchanges/defi.
 This price source is the most stable given its distributed nature.
-It is also more trustless.
+It is also fairly trustless since trust is highly distributed.
+It can also be available for derivatives. Many exchanges support derivative prices.
 
-We may assume that this is always available for spot. Oracles refreshes this.
+Current oracle maintains this pricing.
+
+Limitations:
+- The pricing provided by oracles may not align with our actual exchange prices/demand.
+- Hence, it's not great to use index prices as the singular source of truth.
+
+We may assume that this is always available for spot pricing.
 """
 ORACLE_INDEX_PRICES: Dict[str, float] = {
     encode_a(Asset.USDC): 1.000,
     encode_a(Asset.ETH): 1182.42,
-    encode_a(Asset.BTC): 16739.50
+    encode_a(Asset.BTC): 16739.50,
+    encode_d(SAMPLE_PUT): 839.12,
+    encode_d(SAMPLE_PERP): 1182.12
 }
 """
-Market prices are uploaded by the operator based on best bid/ask pair.
-This is required for options where spot index prices are not useful for deriving value.
-But this also helps provide futures/perps market prices to make margin
-computations more accurate.
+Market prices are uploaded by the operator based on the best bid/ask pair.
+This is required for options where index prices are much less available.
+This can also be applied across spot/futures/perps use cases to keep mark prices more aligned with actual exchange prices.
 
-The drawback of this pricing source is that it requires some trust.
-If this pricing source submits the best bid and best ask signatures,
-its trustlessness improves substantially.
+A new oracle has to be created to support this pricing.
 
-We may assume that this is always available for options. Operator refreshes this.
+Limitations:
+- This pricing requires some trust.
+- If this pricing source submits the best bid and best ask signatures, its trustlessness improves substantially.
+- This pricing is much more prone to price fluctuations.
+
+We may assume that this is always available for options pricing.
 """
 MARKET_PRICES: Dict[str, float] = {
     encode_a(Asset.USDC): 1.000,
@@ -188,19 +199,19 @@ MARKET_PRICES: Dict[str, float] = {
 }
 """
 Moving averages are backward looking market prices. 
-It is far more trustless than market prices since they use transacted
-orders which are forge-proof.
+It is far more trustless than market prices since they use transacted orders which are forge-proof.
+It is also more trustless than oracle index prices since transacted prices are essentially trustless.
+These prices are the most efficient to implement.
+- Use EWMA to compute moving average price, and a circular buffer to maintain freshness.
+These prices do not depend on external systems.
 
-The drawback of this pricing source is that its accuracy falls off
-substantially in non-liquid markets. Using a time-bound filter fixes
-the accuracy problem, but makes this data source less available.
+Limitations:
+- In an illiquid market, the following tradeoff has to be made.
+  - Without time-bound filters, this pricing source will be highly inaccurate.
+  - With time-bound filters, this pricing source will be less available.
 
-There are many ways we can compute moving averages.
-1. Average (or EWMA) of last N orders
-2. Average (or EWMA) of orders from last N minutes
-3. Combination of above two
-
-We do not assume that this is always available.
+We may assume that these prices are HIGHLY ACCURATE AND AVAILABLE in liquid markets.
+We may not assume that markets are always liquid.
 """
 MOVING_AVERAGE_PRICES: Dict[str, float] = {
     encode_a(Asset.ETH): 1182.42,
@@ -213,6 +224,17 @@ MOVING_AVERAGE_PRICES: Dict[str, float] = {
 The price at which all expired options and futures settled.
 
 There is one entry here per underlying asset, and expiry date.
+
+We may not assume that settlement prices are available for all expired options
+and futures. Settlement prices could come in late due to race conditions, or 
+operator Message Queue backlog.
+
+Options and Futures mark prices converge closer and closer to settlement prices as it heads towards expiry.
+At the point of expiry, the operator will stop streaming index & market price ticks to StarkEx. 
+As such, even in the absence of a settlement price, the mark price will be a very reliable estimate for computing balances and margins. 
+
+But we should never allow the exercise of options & futures when the settlement tick has yet to arrive. 
+Even if the estimate is a tiny bit off, it will cause a drift in our exchange's total holdings in StarkEx.
 """
 SETTLEMENT_PRICES: Dict[str, float] = {
     # The key is an encoded derivative with just the asset and expiry filled
@@ -250,10 +272,11 @@ PORTFOLIO_MARGIN_INITIAL_MULTIPLIER = 1.3
 
 
 class AssetConfig:
-    def __init__(self, fvm: int, fim: float, fmm:  float, oim:  float, omm:  float, srs: float, vrs: float, rfr: float):
+    def __init__(self, fvm: int, fim: float, fmm: float, ovm: int, oim:  float, omm:  float, srs: float, vrs: float, rfr: float):
         self.future_variable_margin = fvm
         self.future_initial_margin = fim
         self.future_maintenance_margin = fmm
+        self.option_variable_margin = ovm
         self.option_initial_margin = oim
         self.option_maintenance_margin = omm
         self.spot_range_simulation = srs
@@ -262,8 +285,8 @@ class AssetConfig:
 
 
 ASSET_CONFIG: Dict[Asset, AssetConfig] = {
-    Asset.ETH: AssetConfig(50000, 0.01, 0.02, 0.05, 0.10, 0.2, 0.45, 0.0),
-    Asset.BTC: AssetConfig(50000, 0.01, 0.02, 0.05, 0.10, 0.2, 0.45, 0.0)
+    Asset.ETH: AssetConfig(5000000, 0.01, 0.02, 500000, 0.05, 0.10, 0.2, 0.45, 0.0),
+    Asset.BTC: AssetConfig(5000000, 0.01, 0.02, 500000, 0.05, 0.10, 0.2, 0.45, 0.0),
 }
 
 ########################
@@ -271,9 +294,14 @@ ASSET_CONFIG: Dict[Asset, AssetConfig] = {
 ########################
 
 
-def get_spot_mark_price(asset_id: str, prices: Prices) -> float:
+def get_mark_price(asset_id: str, prices: Prices) -> float:
     """
-    Spot mark price is the average of all three price sources (whenever available)
+    An Asset's mark price takes all three price sources into consideration (whenever available)
+
+    If three sources are available, the median price is used. 
+    Medians are more resistent to outlier skew.
+
+    If two sources are available, take the average (or weighted average as an optimization).
     """
     sources = [prices.oracle_index[asset_id]]
     market = prices.market.get(asset_id, None)
@@ -282,6 +310,8 @@ def get_spot_mark_price(asset_id: str, prices: Prices) -> float:
     moving_avg = prices.moving_avg.get(asset_id, None)
     if moving_avg != None:
         sources.append(moving_avg)
+    if len(sources) == 3:
+        return sorted(sources)[1]
     return sum(sources) / len(sources)
 
 
@@ -304,25 +334,22 @@ def get_deriv_settled_price(asset_id: str, prices: Prices):
     return None  # will never be hit
 
 
+def get_spot_mark_price(asset_id: str, prices: Prices) -> float:
+    """
+    Spot mark price uses the standard mark price algorithm
+    """
+    return get_mark_price(asset_id, prices)
+
+
 def get_deriv_mark_price(asset_id: str, prices: Prices) -> float:
     """
-    Mark Price is the simple average of all three price sources (whenever available)
+    Derivative mark price uses the standard mark price algorithm
     If the derivative is already settled, it uses the settled price instead
     """
     settled_price = get_deriv_settled_price(asset_id, prices)
     if settled_price != None:
         return settled_price
-    deriv = decode_d(asset_id)
-    sources = []
-    if deriv.instrument == Instrument.PERPETUAL or deriv.instrument == Instrument.FUTURE:
-        sources.append(prices.oracle_index[encode_a(deriv.underlying_asset)])
-    market = prices.market.get(asset_id, None)
-    if market != None:
-        sources.append(market)
-    moving_avg = prices.moving_avg.get(asset_id, None)
-    if moving_avg != None:
-        sources.append(moving_avg)
-    return sum(sources) / len(sources)
+    return get_mark_price(asset_id, prices)
 
 ####################
 # MARGIN COMPUTATION
@@ -349,23 +376,30 @@ def get_vault_simple_margin(vault: Vault, prices: Prices, conf: Dict[Asset, Asse
 
     Perpetuals and Futures follow the below formula
       Deriv Notional           = Size * Deriv Mark Price
-      Initial Margin Ratio     = 2% + Deriv Notional / $50000
-      Maintenance Margin Ratio = 1% + Deriv Notional / $50000
-      Margin                   = Deriv Notional * Margin Ratio
+      Initial Margin Ratio     = 2% + Deriv Notional / $500,000,000
+      Maintenance Margin Ratio = 1% + Deriv Notional / $500,000,000
+      Margin                   = Deriv Notional * min(100%, Margin Ratio)
 
     Rationale being that larger positions are more risky, and more difficult to liquidate.
     Hence, larger positions require higher margin ratios, and offer lower leverage.
+    This means that your initial margin ratio linearly increases from 2% to 100% as your
+    position size increases from $0 to $490M
 
-    Options follow the below formula
-      Spot Notional            = Size * Spot Mark Price
-      Initial Margin Ratio     = 10%
-      Maintenance Margin Ratio =  5%
-      Margin                   = Spot Notional * Margin Ratio + Deriv Notional
+    Short Options follow the below formula
+      Initial Margin Ratio     = 10% + Deriv Notional / $50,000,000
+      Maintenance Margin Ratio =  5% + Deriv Notional / $50,000,000
+      Margin                   = Deriv Notional * min(100%, Margin Ratio)
 
     Rationale being that there are many options with different strike prices and expiry in the market.
-    Hence, a fixed margin ratio is applied per option. 
+    Hence, a higher fixed margin ratio, and a steeper slope is applied per option. 
+    This means that your initial margin ratio linearly increases from 10% to 100% as your
+    position size increases from $0 to $45M
+
+    An in-the-money option has high notional value, whereas an out-of-the-money option has a low one.
 
     The ratios mentioned here can be modified using configs.
+    Exchanges/Assets with lower liquidity and TVL typically need to apply steeper slopes.
+    This can also support the dYdX use case where there are no slopes by setting slope to 0.
     """
     total_margin = 0.0
     for position in vault.positions:
@@ -387,10 +421,12 @@ def get_vault_simple_margin(vault: Vault, prices: Prices, conf: Dict[Asset, Asse
             margin_ratio = min(1.0, fixed_margin + variable_margin)
             total_margin += abs(deriv_notional * margin_ratio)
         elif (deriv.instrument == Instrument.OPTION_CALL or deriv.instrument == Instrument.OPTION_PUT) and size < 0:
-            spot_notional = size * \
-                get_spot_mark_price(encode_a(underlying), prices)
             fixed_margin = c.option_maintenance_margin if margin.MAINTENANCE else c.option_initial_margin
-            total_margin += abs(spot_notional * fixed_margin + deriv_notional)
+            # round down to 0.1% AKA 0.001
+            variable_margin = round(
+                deriv_notional / c.option_variable_margin, 3)
+            margin_ratio = min(1.0, fixed_margin + variable_margin)
+            total_margin += abs(deriv_notional * margin_ratio)
     return total_margin
 
 # Portfolio Margin
